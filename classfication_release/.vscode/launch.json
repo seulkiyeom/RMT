@@ -1,0 +1,52 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug train.py", //기본 run.sh 그대로 사용
+            "type": "python",
+            "module": "torch.distributed.run",
+            "request": "launch",
+            // "program": "",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "${workspaceFolder}/main.py",
+                "--warmup-epochs", "5", //warmup epoch
+                "--model", "RMT_S", //Model
+                "--data-path", "data/imagenet", //data path
+                "--num_workers", "16",
+                "--batch-size", "128", //batch size
+                "--drop-path", "0.05",
+                "--epoch", "300",
+                "--dist-eval",
+                "--output_dir", "/ckpt"
+            ],
+
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/..:${env:PYTHONPATH}",
+                "--master_port": "29000", //PORT
+                "--nproc_per_node": "2", //GPUS
+                "--launcher": "pytorch",
+            },
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug temp.py", //기본 run.sh 그대로 사용
+            "type": "python",
+            "request": "launch",
+            // "module": "torch.distributed.launch", //-m torch.distributed.launch
+            "program": "${workspaceFolder}/temp.py",
+            "cwd": "${workspaceFolder}",
+            "args": [
+            ],
+
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/..:${env:PYTHONPATH}",
+                "--launcher": "pytorch",
+            },
+            "console": "integratedTerminal"
+        },
+    ]
+}
