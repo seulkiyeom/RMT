@@ -1,1 +1,6 @@
 classfication_release/data
+classfication_release/ckpt/backup0.pth
+classfication_release/ckpt/best.pth
+classfication_release/ckpt/checkpoint.pth
+classfication_release/ckpt/log.txt
+*.pyc
