@@ -235,6 +235,56 @@ class MaSAd_linear(nn.Module):
         v = v.reshape(bsz, h, w, self.num_heads, -1).permute(0, 1, 3, 2, 4) #(b h n w d2)
 
         kv_mat_w = kr_w.transpose(-1, -2) @ v #(b h n d1 d1)
+        kv_mat_w = kv_mat_w + mask_w  #(b h n w w) <-이거 수정 필요
+        output = torch.matmul(qr_w, kv_mat_w) #(b h n w d1)
+        output = output.transpose(1, 3) #(b w n h d1)
+
+        qr_h = qr.permute(0, 3, 1, 2, 4) #(b w n h d1)
+        kr_h = kr.permute(0, 3, 1, 2, 4) #(b w n h d1)
+        v = v.permute(0, 3, 2, 1, 4) #(b w n h d2)
+
+        kr_mat_h = kr_h.transpose(-1, -2) @ v #(b w n d1 d1)
+        kr_mat_h = kr_mat_h + mask_h  #(b w n h h) <-이거 수정 필요
+        output = torch.matmul(output, kr_mat_h) #(b w n h d1)
+
+        output = output.permute(0, 3, 1, 2, 4).flatten(-2, -1) #(b h w n*d2)
+        output = output + lepe
+        output = self.out_proj(output)
+        return output
+
+class MaSAd_linearcos(nn.Module):
+
+    def __init__(self, embed_dim, num_heads, value_factor=1):
+        super().__init__()
+        self.factor = value_factor
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = self.embed_dim * self.factor // num_heads
+        self.key_dim = self.embed_dim // num_heads
+        self.scaling = self.key_dim ** -0.5
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.v_proj = nn.Linear(embed_dim, embed_dim * self.factor, bias=True)
+        self.lepe = DWConv2d(embed_dim, 5, 1, 2)
+        self.act = nn.ReLU()
+
+
+        self.out_proj = nn.Linear(embed_dim*self.factor, embed_dim, bias=True)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_normal_(self.q_proj.weight, gain=2 ** -2.5)
+        nn.init.xavier_normal_(self.k_proj.weight, gain=2 ** -2.5)
+        nn.init.xavier_normal_(self.v_proj.weight, gain=2 ** -2.5)
+        nn.init.xavier_normal_(self.out_proj.weight)
+        nn.init.constant_(self.out_proj.bias, 0.0)
+
+    def compute_retention(self, qr, kr, v, bsz, h, w):
+        qr_w = qr.transpose(1, 2) #(b h n w d1)
+        kr_w = kr.transpose(1, 2) #(b h n w d1)
+        v = v.reshape(bsz, h, w, self.num_heads, -1).permute(0, 1, 3, 2, 4) #(b h n w d2)
+
+        kv_mat_w = kr_w.transpose(-1, -2) @ v #(b h n d1 d1)
         # kv_mat_w = kv_mat_w + mask_w  #(b h n w w) <-이거 수정 필요
         output = torch.matmul(qr_w, kv_mat_w) #(b h n w d1)
         output = output.transpose(1, 3) #(b w n h d1)
@@ -246,6 +296,44 @@ class MaSAd_linear(nn.Module):
         kr_mat_h = kr_h.transpose(-1, -2) @ v #(b w n d1 d1)
         # kr_mat_h = kr_mat_h + mask_h  #(b w n h h) <-이거 수정 필요
         output = torch.matmul(output, kr_mat_h) #(b w n h d1)
+        return output
+
+
+    def forward(self, x: torch.Tensor, rel_pos, chunkwise_recurrent=False, incremental_state=None):
+        '''
+        x: (b h w c)
+        mask_h: (n h h)
+        mask_w: (n w w)
+        '''
+        bsz, h, w, _ = x.size()
+
+        mask_h, mask_w = rel_pos
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        lepe = self.lepe(v)
+
+        k *= self.scaling
+        qr = q.view(bsz, h, w, self.num_heads, self.key_dim).permute(0, 3, 1, 2, 4) #(b n h w d1)
+        kr = k.view(bsz, h, w, self.num_heads, self.key_dim).permute(0, 3, 1, 2, 4) #(b n h w d1)
+
+        qr = self.act(qr)
+        kr = self.act(kr)
+        '''
+        qr: (b n h w d1)
+        kr: (b n h w d1)
+        v: (b h w n*d2)
+        '''
+        qr_cos = qr.cos()
+        qr_sin = qr.sin()
+        kr_cos = kr.cos()
+        kr_sin = kr.sin()
+
+        cos_out = self.compute_retention(qr_cos, kr_cos, v, bsz, h, w)
+        sin_out = self.compute_retention(qr_sin, kr_sin, v, bsz, h, w)
+
+        output = cos_out + sin_out
 
         output = output.permute(0, 3, 1, 2, 4).flatten(-2, -1) #(b h w n*d2)
         output = output + lepe
@@ -419,8 +507,9 @@ class RetBlock(nn.Module):
         self.retention_layer_norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
         assert retention in ['chunk', 'whole']
         if retention == 'chunk':
+            self.retention = MaSAd_linearcos(embed_dim, num_heads) #슬기가 사용할 것
             # self.retention = MaSAd_linear(embed_dim, num_heads) #슬기가 사용할 것
-            self.retention = MaSAd(embed_dim, num_heads)
+            # self.retention = MaSAd(embed_dim, num_heads)
             # self.retention = linear_attention(embed_dim, num_heads)
         else:
             self.retention = MaSA(embed_dim, num_heads)
@@ -503,6 +592,7 @@ class BasicLayer(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.depth = depth
+        self.num_heads = num_heads
         self.use_checkpoint = use_checkpoint
         self.chunkwise_recurrent = chunkwise_recurrent
         if chunkwise_recurrent:
@@ -525,7 +615,12 @@ class BasicLayer(nn.Module):
 
     def forward(self, x):
         b, h, w, d = x.size()
-        rel_pos = self.Relpos((h, w), chunkwise_recurrent=self.chunkwise_recurrent)
+        # rel_pos = self.Relpos((h, w), chunkwise_recurrent=self.chunkwise_recurrent)
+        if self.chunkwise_recurrent:
+            rel_pos = self.Relpos((d/self.num_heads, d/self.num_heads), chunkwise_recurrent=self.chunkwise_recurrent) #여기 수정함 슬기
+        else:
+            rel_pos = self.Relpos((h, w), chunkwise_recurrent=self.chunkwise_recurrent) #여기 수정함 슬기
+
         for blk in self.blocks:
             if self.use_checkpoint:
                 tmp_blk = partial(blk, incremental_state=None, chunkwise_recurrent=self.chunkwise_recurrent, retention_rel_pos=rel_pos)
