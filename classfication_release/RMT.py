@@ -33,6 +33,82 @@ class DWConv2d(nn.Module):
         x = x.permute(0, 2, 3, 1) #(b h w c)
         return x
     
+class RelPos2d_sk(nn.Module):
+    def __init__(self, embed_dim, num_heads, initial_value, heads_range):
+        super().__init__()
+        self.initial_value = initial_value
+        self.heads_range = heads_range
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        decay = torch.log(1 - 2 ** (-initial_value - heads_range * torch.arange(num_heads, dtype=torch.float) / num_heads))
+
+        self.register_buffer('decay', decay)
+
+    def create_distance_matrix(self, size, x, y):
+        # x, y 좌표를 위한 벡터 생성
+        x_coord = torch.arange(size)
+        y_coord = torch.arange(size)
+
+        # x, y 좌표의 차이를 계산하여 중심점 (x, y)로부터의 거리 계산
+        distance_matrix = torch.sqrt((x_coord - x).pow(2).unsqueeze(0) + (y_coord - y).pow(2).unsqueeze(1))
+
+        # 거리 행렬을 최대 거리 값으로 정규화
+        normalized_distance_matrix = distance_matrix / distance_matrix.max()
+
+        # 정규화된 거리 행렬에 대해 cos 변환 수행
+        return torch.cos((torch.pi / 2) * normalized_distance_matrix)
+
+    def generate_decay_matrix(self, height, width):
+        # 감쇠 행렬을 0으로 초기화
+        decay_matrix = torch.zeros(height * width, height * width)
+
+        # 각 중심점에 대해 거리 행렬 생성 및 감쇠 행렬 업데이트
+        for i in range(height):
+            for j in range(width):
+                decay_matrix[i * width + j] = self.create_distance_matrix(height, i, j).view(-1)
+
+        # 감쇠 행렬을 2차원으로 재구성
+        return decay_matrix * self.decay[:, None, None]  #(n H*W H*W)
+
+
+    # def create_distance_matrix(self, size, x, y):
+    #     # 이미지의 높이와 너비 설정
+    #     height, width = size, size
+
+    #     # 각 픽셀의 x, y 좌표를 담은 그리드 생성
+    #     x_coord = torch.arange(width).view(1, width).expand(height, width)
+    #     y_coord = torch.arange(height).view(height, 1).expand(height, width)
+    #     # 중심점 (x, y)로부터의 Euclidean 거리를 계산
+    #     distance_matrix = torch.sqrt((x_coord - x) ** 2 + (y_coord - y) ** 2)
+
+    #     # 거리 매트릭스를 최대 거리 값으로 나누어 정규화
+    #     normalized_distance_matrix = distance_matrix / distance_matrix.max()
+
+    #     return torch.cos((torch.pi/2) * normalized_distance_matrix)
+
+    # def generate_decay_matrix(self, height):
+    #     decay_matrix = torch.zeros(height**2, height**2)
+    #     for i in range(height):
+    #         for j in range(height):
+    #             distance_matrix = self.create_distance_matrix(height, i, j).view(-1)
+    #             decay_matrix[i * height + j, :] = distance_matrix
+
+    #     decay_matrix = decay_matrix.expand(self.num_heads, -1, -1)
+
+    #     return decay_matrix
+
+    def forward(self, slen: Tuple[int], activate_recurrent=False, chunkwise_recurrent=False):
+        '''
+        slen: (h, w)
+        h * w == l
+        recurrent is not implemented
+        '''
+        mask = self.generate_decay_matrix(slen[0], slen[1]) #input param: height
+        
+        retention_rel_pos = mask
+
+        return retention_rel_pos
+
 
 class RelPos2d(nn.Module):
 
@@ -51,7 +127,9 @@ class RelPos2d(nn.Module):
         self.initial_value = initial_value
         self.heads_range = heads_range
         self.num_heads = num_heads
+        self.embed_dim = embed_dim
         decay = torch.log(1 - 2 ** (-initial_value - heads_range * torch.arange(num_heads, dtype=torch.float) / num_heads))
+
         self.register_buffer('angle', angle)
         self.register_buffer('decay', decay)
         
@@ -279,14 +357,24 @@ class MaSAd_linearcos(nn.Module):
         nn.init.xavier_normal_(self.out_proj.weight)
         nn.init.constant_(self.out_proj.bias, 0.0)
 
-    def compute_retention(self, qr, kr, v, bsz, h, w):
+    def compute_retention(self, qr, kr, v, bsz, h, w, mask_h, mask_w):
         qr_w = qr.transpose(1, 2) #(b h n w d1)
         kr_w = kr.transpose(1, 2) #(b h n w d1)
         v = v.reshape(bsz, h, w, self.num_heads, -1).permute(0, 1, 3, 2, 4) #(b h n w d2)
 
+        cos_mat = torch.cos(mask_w).unsqueeze(0).unsqueeze(-1).permute(0,2,1,3,4)
+        sin_mat = torch.sin(mask_w).unsqueeze(0).unsqueeze(-1).permute(0,2,1,3,4)
+
+        # attention = softmax(q @ k.transpose()) @ v
+        # linear_attention = q @ (k.transpose() @ v)
+        # retention = 
+
         kv_mat_w = kr_w.transpose(-1, -2) @ v #(b h n d1 d1)
         # kv_mat_w = kv_mat_w + mask_w  #(b h n w w) <-이거 수정 필요
         output = torch.matmul(qr_w, kv_mat_w) #(b h n w d1)
+        output_cos = output * cos_mat
+        output_sin = output * sin_mat
+        output = output_cos + output_sin
         output = output.transpose(1, 3) #(b w n h d1)
 
         qr_h = qr.permute(0, 3, 1, 2, 4) #(b w n h d1)
@@ -296,7 +384,16 @@ class MaSAd_linearcos(nn.Module):
         kr_mat_h = kr_h.transpose(-1, -2) @ v #(b w n d1 d1)
         # kr_mat_h = kr_mat_h + mask_h  #(b w n h h) <-이거 수정 필요
         output = torch.matmul(output, kr_mat_h) #(b w n h d1)
+        output_cos = output * cos_mat
+        output_sin = output * sin_mat
+        output = output_cos + output_sin
         return output
+    
+    def create_matrix(self, M, cosine=True):
+        if cosine:
+            return torch.tensor([math.cos(math.pi * i / (2 * M)) for i in range(1, M + 1)], dtype=torch.float)
+        else:
+            return torch.tensor([math.sin(math.pi * i / (2 * M)) for i in range(1, M + 1)], dtype=torch.float)
 
 
     def forward(self, x: torch.Tensor, rel_pos, chunkwise_recurrent=False, incremental_state=None):
@@ -325,15 +422,11 @@ class MaSAd_linearcos(nn.Module):
         kr: (b n h w d1)
         v: (b h w n*d2)
         '''
-        qr_cos = qr.cos()
-        qr_sin = qr.sin()
-        kr_cos = kr.cos()
-        kr_sin = kr.sin()
 
-        cos_out = self.compute_retention(qr_cos, kr_cos, v, bsz, h, w)
-        sin_out = self.compute_retention(qr_sin, kr_sin, v, bsz, h, w)
+        # cos_mat = self.create_matrix(h, cosine=True)
+        # sin_mat = self.create_matrix(h, cosine=False)
 
-        output = cos_out + sin_out
+        output = self.compute_retention(qr, kr, v, bsz, h, w, mask_h, mask_w)
 
         output = output.permute(0, 3, 1, 2, 4).flatten(-2, -1) #(b h w n*d2)
         output = output + lepe
@@ -370,7 +463,7 @@ class MaSA(nn.Module):
         rel_pos: mask: (n l l)
         '''
         bsz, h, w, _ = x.size()
-        mask = rel_pos
+        mask = rel_pos.to(x)
         
         assert h*w == mask.size(1)
 
@@ -389,6 +482,8 @@ class MaSA(nn.Module):
         vr = v.reshape(bsz, h, w, self.num_heads, -1).permute(0, 3, 1, 2, 4) #(b n h w d2)
         vr = vr.flatten(2, 3) #(b n l d2)
         qk_mat = qr @ kr.transpose(-1, -2) #(b n l l)
+
+        # print(f"is CUDDAAAAAAAAAAAAAA? {qk_mat.is_cuda} and {mask.is_cuda}")
         qk_mat = qk_mat + mask  #(b n l l)
         qk_mat = torch.softmax(qk_mat, -1) #(b n l l)
         output = torch.matmul(qk_mat, vr) #(b n l d2)
@@ -507,9 +602,9 @@ class RetBlock(nn.Module):
         self.retention_layer_norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
         assert retention in ['chunk', 'whole']
         if retention == 'chunk':
-            self.retention = MaSAd_linearcos(embed_dim, num_heads) #슬기가 사용할 것
+            # self.retention = MaSAd_linearcos(embed_dim, num_heads) #슬기가 사용할 것
             # self.retention = MaSAd_linear(embed_dim, num_heads) #슬기가 사용할 것
-            # self.retention = MaSAd(embed_dim, num_heads)
+            self.retention = MaSAd(embed_dim, num_heads)
             # self.retention = linear_attention(embed_dim, num_heads)
         else:
             self.retention = MaSA(embed_dim, num_heads)
@@ -599,7 +694,8 @@ class BasicLayer(nn.Module):
             flag = 'chunk'
         else:
             flag = 'whole'
-        self.Relpos = RelPos2d(embed_dim, num_heads, init_value, heads_range)
+        # self.Relpos = RelPos2d(embed_dim, num_heads, init_value, heads_range)
+        self.Relpos = RelPos2d_sk(embed_dim, num_heads, init_value, heads_range)
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -795,7 +891,8 @@ def RMT_S(args):
         heads_ranges=[4, 4, 6, 6],
         mlp_ratios=[4, 4, 3, 3],
         drop_path_rate=0.15,
-        chunkwise_recurrents=[True, True, True, False],
+        # chunkwise_recurrents=[True, True, True, False], #기존 RMT_S에서 사용한 형태
+        chunkwise_recurrents=[False, False, False, False], #테스트용 MaSA를 사용하는 RMT (원래는 MaSA (if chunkwise_recurrent is true))
         layerscales=[False, False, False, False]
     )
     model.default_cfg = _cfg()
